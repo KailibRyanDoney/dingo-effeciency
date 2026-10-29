@@ -330,7 +330,9 @@ class WaveformGenerator:
 
     def _multi_phase_fd_pols_by_repeated_calls(self, parameters, ell_max):
         """
-        Evaluate the FD polarizations on the phase grid, one waveform call per point.
+        Evaluate the FD polarizations on the phase grid, one waveform call per point,
+        or a single LS.SimInspiralFDMultiPhase call where LALSimulation has it (see
+        _multi_phase_fd_pols_in_one_call).
 
         Used for models whose polarization routine is cheaper than their
         individual-mode routine but for which we do not share dynamics across phases
@@ -346,15 +348,69 @@ class WaveformGenerator:
         """
         phi_c_offsets = np.linspace(0, 2 * np.pi, 2 * ell_max + 1, endpoint=False)
         phase_ref = parameters["phase"]
-        hpc_fd_list = [
-            self.generate_hplus_hcross(
-                {**parameters, "phase": phase_ref + phi_c},
-                catch_waveform_errors=False,
-                apply_postprocessing=False,
-            )
-            for phi_c in phi_c_offsets
-        ]
+        hpc_fd_list = self._multi_phase_fd_pols_in_one_call(
+            parameters, phase_ref + phi_c_offsets
+        )
+        if hpc_fd_list is None:
+            hpc_fd_list = [
+                self.generate_hplus_hcross(
+                    {**parameters, "phase": phase_ref + phi_c},
+                    catch_waveform_errors=False,
+                    apply_postprocessing=False,
+                )
+                for phi_c in phi_c_offsets
+            ]
         return hpc_fd_list, phi_c_offsets
+
+    def _multi_phase_fd_pols_in_one_call(self, parameters, phases):
+        """
+        The FD polarizations at several phases from one LS.SimInspiralFDMultiPhase
+        call, each post-processed as generate_FD_waveform post-processes an
+        LS.SimInspiralFD call. For IMRPhenomXPHM that function computes the
+        non-precessing modes and the Euler angles once for all phases, and agrees
+        with one LS.SimInspiralFD call per phase to round-off.
+
+        The LAL arguments differ between the phases only in phiRef, since the phase
+        that converts the spins is fixed (spin_conversion_phase). Returns None where
+        this does not apply: LALSimulation without the function, a target function
+        other than LS.SimInspiralFD, or a waveform flagged as numerically unstable,
+        which the repeated calls regenerate without multibanding. Also for a subclass
+        that changes generate_hplus_hcross or generate_FD_waveform (e.g. to apply a
+        lensing amplification), since the one call would bypass that.
+        """
+        multi_phase = getattr(LS, "SimInspiralFDMultiPhase", None)
+        if multi_phase is None or self.spin_conversion_phase is None:
+            return None
+        cls = type(self)
+        if (
+            cls.generate_hplus_hcross is not WaveformGenerator.generate_hplus_hcross
+            or cls.generate_FD_waveform is not WaveformGenerator.generate_FD_waveform
+        ):
+            return None
+        parameters_lal, target_function = self._convert_parameters(
+            {**parameters, "f_ref": self.f_ref},
+            self.lal_params,
+            return_target_function=True,
+        )
+        if target_function != LS.SimInspiralFD:
+            return None
+
+        phase_vector = lal.CreateREAL8Vector(len(phases))
+        phase_vector.data[:] = phases
+        hp, _, hp_rows, hc_rows = multi_phase(
+            *parameters_lal[:10], phase_vector, *parameters_lal[11:]
+        )
+        hp_rows, hc_rows = hp_rows.data, hc_rows.data
+        if max(np.max(np.abs(hp_rows)), np.max(np.abs(hc_rows))) > 1e-20:
+            return None
+
+        time_shift = self._sim_inspiral_fd_time_shift(hp.deltaF, hp.epoch)
+        return [
+            self._postprocess_sim_inspiral_fd(
+                h_plus, h_cross, hp.deltaF, hp.epoch, time_shift
+            )
+            for h_plus, h_cross in zip(hp_rows, hc_rows)
+        ]
 
     def generate_hplus_hcross(
         self,
@@ -849,37 +905,9 @@ class WaveformGenerator:
         # Postprocessing, specific for target_function.
         # For LS.SimInspiralFD, this includes sanity checks and possibly truncation.
         if target_function == LS.SimInspiralFD:
-            # Ensure that the waveform agrees with the frequency grid defined in the domain.
-            if not isclose(self.domain.delta_f, hp.deltaF, rel_tol=1e-6):
-                raise ValueError(
-                    f"Waveform delta_f is inconsistent with domain: {hp.deltaF} vs {self.domain.delta_f}!"
-                    f"To avoid this, ensure that f_max = {self.domain.f_max} is a power of two"
-                    "when you are using a native time-domain waveform model."
-                )
-
-            frequency_array = self.domain()
-            h_plus = np.zeros_like(frequency_array, dtype=complex)
-            h_cross = np.zeros_like(frequency_array, dtype=complex)
-            # Ensure that length of wf agrees with length of domain. Enforce by truncating frequencies beyond f_max
-            if len(hp.data.data) > len(frequency_array):
-                warnings.warn(
-                    "LALsimulation waveform longer than domain's `frequency_array`"
-                    f"({len(hp.data.data)} vs {len(frequency_array)}). Truncating lalsim array."
-                )
-                h_plus = hp.data.data[: len(h_plus)]
-                h_cross = hc.data.data[: len(h_cross)]
-            else:
-                h_plus[: len(hp.data.data)] = hp.data.data
-                h_cross[: len(hc.data.data)] = hc.data.data
-
-            # Undo the time shift done in SimInspiralFD to the waveform. The domain's
-            # frequencies are float32, so compute the phase in float64: in single
-            # precision it is off by several ns in time.
-            dt = 1 / hp.deltaF + (hp.epoch.gpsSeconds + hp.epoch.gpsNanoSeconds * 1e-9)
-            time_shift = np.exp(-1j * 2 * np.pi * dt * frequency_array.astype(float))
-            h_plus *= time_shift
-            h_cross *= time_shift
-            return {"h_plus": h_plus, "h_cross": h_cross}
+            return self._postprocess_sim_inspiral_fd(
+                hp.data.data, hc.data.data, hp.deltaF, hp.epoch
+            )
 
         elif target_function == LS.SimInspiralChooseFDWaveformSequence:
             frequency_array = self.domain()[self.domain.min_idx :]
@@ -894,6 +922,50 @@ class WaveformGenerator:
             raise NotImplementedError(
                 f"Unsupported lal target function " f"{target_function}."
             )
+
+    def _sim_inspiral_fd_time_shift(self, delta_f, epoch) -> np.ndarray:
+        """The phase factor that undoes the time shift LS.SimInspiralFD applies to the
+        waveform, from the delta_f and epoch of its output. The domain's frequencies
+        are float32, so compute the phase in float64: in single precision it is off by
+        several ns in time."""
+        dt = 1 / delta_f + (epoch.gpsSeconds + epoch.gpsNanoSeconds * 1e-9)
+        return np.exp(-1j * 2 * np.pi * dt * self.domain().astype(float))
+
+    def _postprocess_sim_inspiral_fd(
+        self, h_plus_lal, h_cross_lal, delta_f, epoch, time_shift=None
+    ) -> Dict[str, np.ndarray]:
+        """Post-process the polarizations of an LS.SimInspiralFD call: check delta_f
+        against the domain, fit them to the domain's frequencies and undo the time
+        shift. time_shift is _sim_inspiral_fd_time_shift(delta_f, epoch), computed
+        here if not given."""
+        # Ensure that the waveform agrees with the frequency grid defined in the domain.
+        if not isclose(self.domain.delta_f, delta_f, rel_tol=1e-6):
+            raise ValueError(
+                f"Waveform delta_f is inconsistent with domain: {delta_f} vs {self.domain.delta_f}!"
+                f"To avoid this, ensure that f_max = {self.domain.f_max} is a power of two"
+                "when you are using a native time-domain waveform model."
+            )
+
+        frequency_array = self.domain()
+        h_plus = np.zeros_like(frequency_array, dtype=complex)
+        h_cross = np.zeros_like(frequency_array, dtype=complex)
+        # Ensure that length of wf agrees with length of domain. Enforce by truncating frequencies beyond f_max
+        if len(h_plus_lal) > len(frequency_array):
+            warnings.warn(
+                "LALsimulation waveform longer than domain's `frequency_array`"
+                f"({len(h_plus_lal)} vs {len(frequency_array)}). Truncating lalsim array."
+            )
+            h_plus = h_plus_lal[: len(h_plus)]
+            h_cross = h_cross_lal[: len(h_cross)]
+        else:
+            h_plus[: len(h_plus_lal)] = h_plus_lal
+            h_cross[: len(h_cross_lal)] = h_cross_lal
+
+        if time_shift is None:
+            time_shift = self._sim_inspiral_fd_time_shift(delta_f, epoch)
+        h_plus *= time_shift
+        h_cross *= time_shift
+        return {"h_plus": h_plus, "h_cross": h_cross}
 
     def generate_hplus_hcross_m(
         self, parameters: Dict[str, float]

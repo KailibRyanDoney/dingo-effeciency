@@ -12,6 +12,8 @@ which needs to be accounted for in postprocessing. The tests below all use
 wfg.spin_conversion_phase = 0.0.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import numpy as np
 import lal
@@ -503,6 +505,113 @@ def test_dft_phase_grid_ignores_transform(dft_wfg_pair):
     for m, pol in pol_m.items():
         for name, expected in pol.items():
             np.testing.assert_array_equal(pol_m_with_transform[m][name], expected)
+
+
+def _multi_phase_by_repeated_sim_inspiral_fd(*args):
+    """LS.SimInspiralFDMultiPhase built from one LS.SimInspiralFD call per phase:
+    the first phase's polarizations, then every phase's as rows."""
+    calls = [LS.SimInspiralFD(*args[:10], phase, *args[11:]) for phase in args[10].data]
+    rows = [
+        SimpleNamespace(data=np.array([call[i].data.data for call in calls]))
+        for i in (0, 1)
+    ]
+    return calls[0][0], calls[0][1], rows[0], rows[1]
+
+
+@pytest.mark.parametrize("approximant", ["IMRPhenomXPHM"])
+def test_one_multi_phase_call_matches_repeated_calls(dft_wfg_pair, monkeypatch):
+    """With LS.SimInspiralFDMultiPhase, the m-components come from one call.
+
+    The function is stood in for by one LS.SimInspiralFD call per phase, so this
+    checks the wiring: each phase is post-processed exactly as generate_FD_waveform
+    post-processes an LS.SimInspiralFD call, and the route does not fall back to
+    the repeated calls.
+    """
+    wfg_dft, _ = dft_wfg_pair
+    monkeypatch.delattr(LS, "SimInspiralFDMultiPhase", raising=False)
+    repeated = [wfg_dft.generate_hplus_hcross_m(p) for p in DFT_PARAMETERS]
+
+    monkeypatch.setattr(
+        LS,
+        "SimInspiralFDMultiPhase",
+        _multi_phase_by_repeated_sim_inspiral_fd,
+        raising=False,
+    )
+
+    def no_repeated_calls(*args, **kwargs):
+        raise AssertionError("fell back to one generate_hplus_hcross call per phase")
+
+    monkeypatch.setattr(wfg_dft, "generate_hplus_hcross", no_repeated_calls)
+    one_call = [wfg_dft.generate_hplus_hcross_m(p) for p in DFT_PARAMETERS]
+
+    for pol_m, pol_m_ref in zip(one_call, repeated):
+        assert set(pol_m) == set(pol_m_ref)
+        for m in pol_m_ref:
+            for name in pol_m_ref[m]:
+                np.testing.assert_array_equal(pol_m[m][name], pol_m_ref[m][name])
+
+
+@pytest.mark.parametrize("approximant", ["IMRPhenomXPHM"])
+def test_one_call_route_leaves_changed_polarizations_alone(
+    uniform_fd_domain, approximant, monkeypatch
+):
+    """A subclass that changes generate_hplus_hcross keeps the repeated calls.
+
+    A lensed waveform generator, for instance, multiplies the polarizations by the
+    amplification factor there; one LS.SimInspiralFDMultiPhase call would skip it.
+    """
+
+    class Doubled(WaveformGenerator):
+        def generate_hplus_hcross(self, parameters, **kwargs):
+            pol = super().generate_hplus_hcross(parameters, **kwargs)
+            return {k: 2.0 * v for k, v in pol.items()}
+
+    kwargs = dict(
+        approximant=approximant,
+        domain=uniform_fd_domain,
+        f_ref=10.0,
+        f_start=10.0,
+        spin_conversion_phase=0.0,
+        mode_list=[(2, 2), (2, 1), (3, 3), (3, 2), (4, 4)],
+        use_dft_phase_decomposition=True,
+    )
+    monkeypatch.setattr(
+        LS,
+        "SimInspiralFDMultiPhase",
+        _multi_phase_by_repeated_sim_inspiral_fd,
+        raising=False,
+    )
+    p = DFT_PARAMETERS[0]
+    pol_m = WaveformGenerator(**kwargs).generate_hplus_hcross_m(p)
+    pol_m_doubled = Doubled(**kwargs).generate_hplus_hcross_m(p)
+    for m in pol_m:
+        for name in pol_m[m]:
+            np.testing.assert_allclose(
+                pol_m_doubled[m][name], 2.0 * pol_m[m][name], rtol=1e-14, atol=0
+            )
+
+
+@pytest.mark.skipif(
+    not hasattr(LS, "SimInspiralFDMultiPhase"),
+    reason="needs LALSimulation with XLALSimInspiralFDMultiPhase",
+)
+@pytest.mark.parametrize("approximant", ["IMRPhenomXPHM"])
+def test_lalsimulation_multi_phase_matches_repeated_calls(dft_wfg_pair, monkeypatch):
+    """LALSimulation's XLALSimInspiralFDMultiPhase, which computes XPHM's modes and
+    Euler angles once for all phases, gives the m-components of the repeated calls
+    to round-off."""
+    wfg_dft, _ = dft_wfg_pair
+    for p in DFT_PARAMETERS:
+        one_call = wfg_dft.generate_hplus_hcross_m(p)
+        with monkeypatch.context() as patch:
+            patch.delattr(LS, "SimInspiralFDMultiPhase")
+            repeated = wfg_dft.generate_hplus_hcross_m(p)
+        for name in ("h_plus", "h_cross"):
+            scale = max(np.abs(pol[name]).max() for pol in repeated.values())
+            for m in repeated:
+                np.testing.assert_allclose(
+                    one_call[m][name], repeated[m][name], rtol=0, atol=1e-12 * scale
+                )
 
 
 @pytest.mark.parametrize("approximant", ["IMRPhenomXPHM", "IMRPhenomXPNR"])
